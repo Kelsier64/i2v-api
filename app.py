@@ -1,14 +1,18 @@
 import os
 import sys
+import gc
+import weakref
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Dict, Any
 import asyncio
 import uuid
 import json
 import torch
 import threading
-from queue import Queue
+import logging
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from diffusers.utils import export_to_video
 from diffusers import AutoencoderKLWan, WanPipeline
 from diffusers.schedulers.scheduling_unipc_multistep import UniPCMultistepScheduler
@@ -18,37 +22,87 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import uvicorn
-OUTPUT_DIR = "./videos"
 
-def parse_size(size_str):
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+OUTPUT_DIR = Path("./videos")
+
+# Constants
+MAX_QUEUE_SIZE = 10
+MAX_WORKERS = 2
+MEMORY_CLEANUP_THRESHOLD = 0.1  # Clean up when less than 10% GPU memory available
+PIPELINE_IDLE_TIMEOUT = 300  # Unload pipeline after 5 minutes of inactivity
+
+class MemoryManager:
+    """Enhanced memory management for GPU resources."""
+    
+    @staticmethod
+    def get_gpu_memory_info() -> Dict[str, float]:
+        """Get GPU memory information in GB."""
+        if not torch.cuda.is_available():
+            return {"allocated": 0, "cached": 0, "total": 0, "free": 0}
+        
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        cached = torch.cuda.memory_reserved() / 1024**3
+        total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        free = total - allocated
+        
+        return {
+            "allocated": allocated,
+            "cached": cached, 
+            "total": total,
+            "free": free
+        }
+    
+    @staticmethod
+    def cleanup_gpu_memory():
+        """Aggressive GPU memory cleanup."""
+        if torch.cuda.is_available():
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            logger.info("GPU memory cleaned up")
+    
+    @staticmethod
+    def should_cleanup_memory() -> bool:
+        """Check if memory cleanup is needed."""
+        memory_info = MemoryManager.get_gpu_memory_info()
+        if memory_info["total"] > 0:
+            free_ratio = memory_info["free"] / memory_info["total"]
+            return free_ratio < MEMORY_CLEANUP_THRESHOLD
+        return False
+
+def parse_size(size_str: str) -> tuple[int, int]:
     """Parse size string like '1280*720' into (width, height)."""
-    width, height = map(int, size_str.split('*'))
-    return width, height
+    try:
+        width, height = map(int, size_str.split('*'))
+        return width, height
+    except ValueError as e:
+        logger.error(f"Invalid size format: {size_str}")
+        raise ValueError(f"Invalid size format. Expected 'width*height', got: {size_str}") from e
 
 
-def get_flow_shift(width, height, sample_shift=None):
+def get_flow_shift(width: int, height: int, sample_shift: Optional[float] = None) -> float:
     """Determine flow shift based on resolution."""
     if sample_shift is not None:
         return sample_shift
     
     # Auto-determine based on resolution
-    if height == 480 or width == 480:
-        return 3.0
-    else:
-        return 5.0
+    return 3.0 if height == 480 or width == 480 else 5.0
 
 
-def generate_output_filename(videos_dir, task):
+def generate_output_filename(videos_dir: Path, task: str) -> str:
     """Generate output filename based on UUID and timestamp."""
     # Generate a unique UUID for the video
     video_uuid = str(uuid.uuid4())
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
     # Create videos directory if it doesn't exist
-    os.makedirs(videos_dir, exist_ok=True)
+    videos_dir.mkdir(exist_ok=True)
     
     filename = f"{task}_{timestamp}_{video_uuid}.mp4"
-    return os.path.join(videos_dir, filename)
+    return str(videos_dir / filename)
 
 
 # Pydantic models for API
@@ -80,11 +134,25 @@ class VideoGenerationResponse(BaseModel):
     task_id: Optional[str] = None
 
 
-# Initialize FastAPI app
+# Initialize FastAPI app with lifespan management
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifecycle."""
+    logger.info("🚀 Starting application...")
+    
+    # Startup
+    asyncio.create_task(process_video_generation_queue())
+    yield
+    
+    # Shutdown
+    logger.info("📤 Shutting down application...")
+    await cleanup_resources()
+
 app = FastAPI(
     title="Wan Diffusers Video Generation API",
-    description="API for generating videos using Wan2.1 diffusion models with queue management",
-    version="1.0.0"
+    description="Optimized API for generating videos using Wan2.1 diffusion models with enhanced queue management",
+    version="1.1.0",
+    lifespan=lifespan
 )
 
 # Add CORS middleware
@@ -96,23 +164,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.on_event("startup")
-async def startup_event():
-    """Initialize the queue processor on startup."""
-    # Start the queue processor as a background task
-    asyncio.create_task(process_video_generation_queue())
+# Global variables for enhanced state management
+active_tasks: Dict[str, 'VideoGenerationTask'] = {}
+video_generation_queue = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
+executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
-# Global variable to store active generation tasks
-active_tasks = {}
-
-# Global queue for video generation tasks
-video_generation_queue = asyncio.Queue(maxsize=10)  # Limit to 10 pending tasks
-executor = ThreadPoolExecutor(max_workers=2)  # Limit concurrent generations
-
-# Global pipeline instance to persist across tasks
+# Enhanced pipeline management
 global_pipeline = None
 global_pipeline_config = None
 pipeline_lock = threading.Lock()
+pipeline_last_used = None
+
+async def cleanup_resources():
+    """Clean up resources on shutdown."""
+    logger.info("Cleaning up resources...")
+    if global_pipeline is not None:
+        unload_pipeline()
+    executor.shutdown(wait=True)
+    MemoryManager.cleanup_gpu_memory()
 
 # Task processing status
 class TaskStatus:
@@ -122,6 +191,8 @@ class TaskStatus:
     FAILED = "failed"
 
 class VideoGenerationTask:
+    """Enhanced task management with better error handling and monitoring."""
+    
     def __init__(self, task_id: str, request: "VideoGenerationRequest"):
         self.task_id = task_id
         self.request = request
@@ -132,22 +203,45 @@ class VideoGenerationTask:
         self.created_at = datetime.now()
         self.started_at = None
         self.completed_at = None
+        self.progress = 0.0
+        
+    @property
+    def duration(self) -> Optional[float]:
+        """Get task duration in seconds."""
+        if self.started_at and self.completed_at:
+            return (self.completed_at - self.started_at).total_seconds()
+        return None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert task to dictionary for API responses."""
+        return {
+            "task_id": self.task_id,
+            "status": self.status,
+            "message": self.message,
+            "progress": self.progress,
+            "created_at": self.created_at.isoformat(),
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+            "duration": self.duration,
+            "video_filename": self.video_filename,
+            "error": self.error
+        }
 
 
-def load_pipeline_if_needed(model_id, offload_model=True, t5_cpu=True, flow_shift=5.0):
+def load_pipeline_if_needed(model_id: str, offload_model: bool = True, t5_cpu: bool = True, flow_shift: float = 5.0) -> WanPipeline:
     """
-    Load pipeline only if not already loaded or if configuration changed.
+    Optimized pipeline loading with enhanced memory management.
     
     Args:
-        model_id (str): HuggingFace model ID
-        offload_model (bool): Enable CPU offloading to reduce GPU memory
-        t5_cpu (bool): Keep T5 text encoder on CPU
-        flow_shift (float): Flow shift parameter
+        model_id: HuggingFace model ID
+        offload_model: Enable CPU offloading to reduce GPU memory
+        t5_cpu: Keep T5 text encoder on CPU
+        flow_shift: Flow shift parameter
     
     Returns:
         WanPipeline: The loaded pipeline instance
     """
-    global global_pipeline, global_pipeline_config
+    global global_pipeline, global_pipeline_config, pipeline_last_used
     
     current_config = {
         'model_id': model_id,
@@ -159,41 +253,52 @@ def load_pipeline_if_needed(model_id, offload_model=True, t5_cpu=True, flow_shif
     with pipeline_lock:
         # Check if pipeline needs to be loaded/reloaded
         if global_pipeline is None or global_pipeline_config != current_config:
-            print(f"Loading pipeline with config: {current_config}")
+            logger.info(f"Loading pipeline with config: {current_config}")
             
-            # Unload existing pipeline if present
+            # Cleanup memory before loading
             if global_pipeline is not None:
-                print("Unloading existing pipeline...")
+                logger.info("Unloading existing pipeline...")
                 unload_pipeline()
             
-            # Load VAE
-            try:
-                vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float32)
-            except Exception as e:
-                print(f"Failed to load VAE: {e}")
-                raise e
+            # Additional memory cleanup if needed
+            if MemoryManager.should_cleanup_memory():
+                MemoryManager.cleanup_gpu_memory()
             
-            # Setup scheduler
-            scheduler = UniPCMultistepScheduler(
-                prediction_type='flow_prediction', 
-                use_flow_sigmas=True, 
-                num_train_timesteps=1000, 
-                flow_shift=flow_shift
-            )
-            
-            # Load pipeline
             try:
-                global_pipeline = WanPipeline.from_pretrained(model_id, vae=vae, torch_dtype=torch.bfloat16)
+                # Load VAE with error handling
+                logger.info("Loading VAE...")
+                vae = AutoencoderKLWan.from_pretrained(
+                    model_id, 
+                    subfolder="vae", 
+                    torch_dtype=torch.float32,
+                    local_files_only=False
+                )
+                
+                # Setup scheduler
+                scheduler = UniPCMultistepScheduler(
+                    prediction_type='flow_prediction', 
+                    use_flow_sigmas=True, 
+                    num_train_timesteps=1000, 
+                    flow_shift=flow_shift
+                )
+                
+                # Load pipeline with better error handling
+                logger.info("Loading main pipeline...")
+                global_pipeline = WanPipeline.from_pretrained(
+                    model_id, 
+                    vae=vae, 
+                    torch_dtype=torch.bfloat16,
+                    local_files_only=False
+                )
                 global_pipeline.scheduler = scheduler
                 
                 # Apply memory optimizations
                 if offload_model:
-                    print("Enabling model CPU offloading...")
+                    logger.info("Enabling model CPU offloading...")
                     global_pipeline.enable_model_cpu_offload()
                 
                 if t5_cpu:
-                    print("Moving T5 text encoder to CPU...")
-                    # Move text encoder to CPU to save GPU memory
+                    logger.info("Moving T5 text encoder to CPU...")
                     if hasattr(global_pipeline, 'text_encoder') and global_pipeline.text_encoder is not None:
                         global_pipeline.text_encoder = global_pipeline.text_encoder.to('cpu')
                 
@@ -201,23 +306,31 @@ def load_pipeline_if_needed(model_id, offload_model=True, t5_cpu=True, flow_shif
                     global_pipeline.to("cuda")
                 
                 global_pipeline_config = current_config
-                print("Pipeline loaded successfully")
+                pipeline_last_used = datetime.now()
+                
+                # Log memory usage after loading
+                memory_info = MemoryManager.get_gpu_memory_info()
+                logger.info(f"Pipeline loaded. GPU memory: {memory_info['allocated']:.2f}GB allocated, {memory_info['free']:.2f}GB free")
                     
             except Exception as e:
-                print(f"Failed to load pipeline: {e}")
+                logger.error(f"Failed to load pipeline: {e}")
                 global_pipeline = None
                 global_pipeline_config = None
+                MemoryManager.cleanup_gpu_memory()
                 raise e
+        else:
+            # Update last used time for existing pipeline
+            pipeline_last_used = datetime.now()
         
         return global_pipeline
 
 
 def unload_pipeline():
-    """Unload the global pipeline to free GPU memory."""
+    """Enhanced pipeline unloading with better memory management."""
     global global_pipeline, global_pipeline_config
     
     if global_pipeline is not None:
-        print("Unloading pipeline to free GPU memory...")
+        logger.info("Unloading pipeline to free GPU memory...")
         try:
             # Move pipeline components to CPU and clear CUDA cache
             if hasattr(global_pipeline, 'to'):
@@ -227,96 +340,102 @@ def unload_pipeline():
             global_pipeline = None
             global_pipeline_config = None
             
-            # Force garbage collection and clear CUDA cache
-            import gc
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
+            # Enhanced memory cleanup
+            MemoryManager.cleanup_gpu_memory()
             
-            print("Pipeline unloaded successfully")
+            # Log memory status after cleanup
+            memory_info = MemoryManager.get_gpu_memory_info()
+            logger.info(f"Pipeline unloaded. GPU memory freed: {memory_info['free']:.2f}GB available")
+            
         except Exception as e:
-            print(f"Error during pipeline unload: {e}")
+            logger.error(f"Error during pipeline unload: {e}")
 
 
-def is_queue_empty_and_no_processing():
+def is_queue_empty_and_no_processing() -> bool:
     """Check if queue is empty and no tasks are currently processing."""
     queue_empty = video_generation_queue.qsize() == 0
     
     # Check if any tasks are currently processing
-    processing_tasks = sum(1 for task in active_tasks.values() 
-                          if task.status == TaskStatus.PROCESSING)
+    processing_tasks = sum(1 for task in active_tasks.values() if task.status == TaskStatus.PROCESSING)
     
     return queue_empty and processing_tasks == 0
-    prompt="A cat and a dog baking a cake together in a kitchen. The cat is carefully measuring flour, while the dog is stirring the batter with a wooden spoon. The kitchen is cozy, with sunlight streaming through the window.",
-    negative_prompt="Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards",
-    task="t2v-1.3B",
-    model_id=None,
-    size="832*480",
-    num_frames=81,
-    sample_guide_scale=6.0,
-    sample_shift=None,
-    sample_steps=50,
+
+
+def should_unload_pipeline() -> bool:
+    """Check if pipeline should be unloaded due to inactivity."""
+    global pipeline_last_used
+    
+    if pipeline_last_used is None or global_pipeline is None:
+        return False
+        
+    idle_time = (datetime.now() - pipeline_last_used).total_seconds()
+    return idle_time > PIPELINE_IDLE_TIMEOUT and is_queue_empty_and_no_processing()
+
 def generate_wan_video(
-    prompt="A cat and a dog baking a cake together in a kitchen. The cat is carefully measuring flour, while the dog is stirring the batter with a wooden spoon. The kitchen is cozy, with sunlight streaming through the window.",
-    negative_prompt="Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards",
-    task="t2v-1.3B",
-    model_id=None,
-    size="832*480",
-    num_frames=81,
-    sample_guide_scale=6.0,
-    sample_shift=None,
-    sample_steps=50,
-    fps=16,
-    offload_model=True,
-    t5_cpu=True,
-    output_path=None
-):
+    prompt: str = "A cat and a dog baking a cake together in a kitchen. The cat is carefully measuring flour, while the dog is stirring the batter with a wooden spoon. The kitchen is cozy, with sunlight streaming through the window.",
+    negative_prompt: str = "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards",
+    task: str = "t2v-1.3B",
+    model_id: Optional[str] = None,
+    size: str = "832*480",
+    num_frames: int = 81,
+    sample_guide_scale: float = 6.0,
+    sample_shift: Optional[float] = None,
+    sample_steps: int = 50,
+    fps: int = 16,
+    offload_model: bool = True,
+    t5_cpu: bool = True,
+    output_path: Optional[str] = None
+) -> str:
     """
-    Generate video using Wan2.1 model with diffusers integration.
+    Optimized video generation using Wan2.1 model with enhanced error handling.
     
     Args:
-        prompt (str): Text prompt for video generation
-        negative_prompt (str): Negative prompt to avoid certain content
-        task (str): Model variant - 't2v-1.3B' or 't2v-14B'
-        model_id (str): HuggingFace model ID (overrides task)
-        size (str): Video resolution in format 'width*height'
-        num_frames (int): Number of frames to generate
-        sample_guide_scale (float): Guidance scale for sampling
-        sample_shift (float): Flow shift parameter (auto-determined if None)
-        sample_steps (int): Number of sampling steps
-        fps (int): Output video frame rate
-        offload_model (bool): Enable CPU offloading to reduce GPU memory
-        t5_cpu (bool): Keep T5 text encoder on CPU
-        output_path (str): Output video file path (auto-generated if None)
+        prompt: Text prompt for video generation
+        negative_prompt: Negative prompt to avoid certain content
+        task: Model variant - 't2v-1.3B' or 't2v-14B'
+        model_id: HuggingFace model ID (overrides task)
+        size: Video resolution in format 'width*height'
+        num_frames: Number of frames to generate
+        sample_guide_scale: Guidance scale for sampling
+        sample_shift: Flow shift parameter (auto-determined if None)
+        sample_steps: Number of sampling steps
+        fps: Output video frame rate
+        offload_model: Enable CPU offloading to reduce GPU memory
+        t5_cpu: Keep T5 text encoder on CPU
+        output_path: Output video file path (auto-generated if None)
     
     Returns:
         str: The output path where the video was saved
     """
     
-    # Parse video dimensions
-    width, height = parse_size(size)
+    # Parse video dimensions with validation
+    try:
+        width, height = parse_size(size)
+    except ValueError as e:
+        logger.error(f"Invalid size format: {size}")
+        raise ValueError(f"Invalid video size: {size}") from e
 
     # Determine flow shift
     flow_shift = get_flow_shift(width, height, sample_shift)
     
-    print(f"Using model: {model_id}")
-    print(f"Video size: {width}x{height}")
-    print(f"Flow shift: {flow_shift}")
-    print(f"Model offloading: {offload_model}")
-    print(f"T5 CPU: {t5_cpu}")
+    logger.info(f"Generating video: {width}x{height}, {num_frames} frames, flow_shift={flow_shift}")
+    logger.info(f"Model: {model_id}, CPU offload: {offload_model}, T5 CPU: {t5_cpu}")
     
     # Load or reuse existing pipeline
     try:
         pipe = load_pipeline_if_needed(model_id, offload_model, t5_cpu, flow_shift)
     except Exception as e:
-        print(f"Failed to load pipeline: {e}")
-        raise e
+        logger.error(f"Failed to load pipeline: {e}")
+        raise RuntimeError(f"Pipeline loading failed: {e}") from e
     
-    print(f"Generating video with prompt: {prompt}")
+    logger.info(f"Generating video with prompt: {prompt[:100]}...")
     
-    # Generate video
+    # Generate video with enhanced error handling
     try:
+        # Check memory before generation
+        memory_info = MemoryManager.get_gpu_memory_info()
+        logger.info(f"Pre-generation memory: {memory_info['allocated']:.2f}GB allocated")
+        
         output = pipe(
             prompt=prompt,
             negative_prompt=negative_prompt,
@@ -328,36 +447,53 @@ def generate_wan_video(
         ).frames[0]
         
         # Determine output filename
-        if output_path:
-            final_output_path = output_path
-        else:
-            final_output_path = generate_output_filename(OUTPUT_DIR, task)
+        final_output_path = output_path or generate_output_filename(OUTPUT_DIR, task)
 
-        # Export video
+        # Export video with validation
         export_to_video(output, final_output_path, fps=fps)
-        print(f"Video saved to: {final_output_path}")
+        
+        # Validate output file
+        if not Path(final_output_path).exists():
+            raise RuntimeError(f"Video export failed - file not created: {final_output_path}")
+        
+        file_size = Path(final_output_path).stat().st_size
+        logger.info(f"Video saved: {final_output_path} ({file_size / 1024 / 1024:.2f}MB)")
+        
+        # Cleanup memory after generation
+        if MemoryManager.should_cleanup_memory():
+            MemoryManager.cleanup_gpu_memory()
         
         return final_output_path
         
     except Exception as e:
-        print(f"Failed to generate video: {e}")
-        raise e
+        logger.error(f"Video generation failed: {e}")
+        # Cleanup on error
+        MemoryManager.cleanup_gpu_memory()
+        raise RuntimeError(f"Video generation failed: {e}") from e
 
 
 # API Endpoints
 @app.get("/")
 async def root():
-    """Root endpoint with API information."""
+    """Root endpoint with enhanced API information."""
+    memory_info = MemoryManager.get_gpu_memory_info()
+    
     return {
-        "message": "Wan Diffusers Video Generation API with Queue Management & Pipeline Optimization",
-        "version": "1.0.1",
+        "message": "Optimized Wan Diffusers Video Generation API with Enhanced Queue Management",
+        "version": "1.1.0",
+        "status": "operational",
+        "gpu_info": {
+            "available": torch.cuda.is_available(),
+            "memory_allocated_gb": memory_info["allocated"],
+            "memory_free_gb": memory_info["free"]
+        },
         "features": [
-            "Asynchronous video generation with queue management",
-            "Multiple concurrent workers",
-            "Real-time queue status monitoring",
-            "Task progress tracking",
-            "Intelligent pipeline management - pipeline persists during queue processing",
-            "Automatic pipeline unloading when queue is empty to save GPU memory"
+            "Asynchronous video generation with enhanced queue management",
+            "Optimized memory management and GPU resource handling",
+            "Real-time task progress monitoring",
+            "Intelligent pipeline lifecycle management",
+            "Automatic resource cleanup and optimization",
+            "Enhanced error handling and recovery"
         ],
         "endpoints": {
             "generate": "/generate - POST request to generate video (queued)",
@@ -374,22 +510,51 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint."""
+    """Enhanced health check endpoint with detailed system information."""
     gpu_available = torch.cuda.is_available()
+    memory_info = MemoryManager.get_gpu_memory_info()
+    
+    # Check queue health
+    queue_health = video_generation_queue.qsize() < video_generation_queue._maxsize
+    
+    # Check for any failed tasks recently
+    recent_failures = sum(1 for task in active_tasks.values() 
+                         if task.status == TaskStatus.FAILED and 
+                         (datetime.now() - task.created_at).total_seconds() < 3600)
+    
     return {
-        "status": "healthy",
+        "status": "healthy" if queue_health and recent_failures < 5 else "degraded",
         "gpu_available": gpu_available,
-        "gpu_count": torch.cuda.device_count() if gpu_available else 0
+        "gpu_count": torch.cuda.device_count() if gpu_available else 0,
+        "memory_info": memory_info,
+        "queue_health": queue_health,
+        "recent_failures": recent_failures,
+        "pipeline_loaded": global_pipeline is not None,
+        "active_tasks": len(active_tasks),
+        "queue_size": video_generation_queue.qsize()
     }
 
 
 @app.post("/generate", response_model=VideoGenerationResponse)
 async def generate_video(request: VideoGenerationRequest):
     """
-    Generate a video based on the provided prompt and parameters.
+    Enhanced video generation endpoint with improved validation and error handling.
     Returns immediately with a task ID for async processing using a queue.
     """
+    # Generate unique task ID
     task_id = f"task_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+    
+    # Validate request parameters
+    try:
+        parse_size(request.size)  # Validate size format
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid size format: {request.size}")
+    
+    if request.num_frames < 1 or request.num_frames > 200:
+        raise HTTPException(status_code=400, detail="num_frames must be between 1 and 200")
+    
+    if request.sample_steps < 10 or request.sample_steps > 100:
+        raise HTTPException(status_code=400, detail="sample_steps must be between 10 and 100")
     
     # Create task object
     task = VideoGenerationTask(task_id, request)
@@ -399,17 +564,21 @@ async def generate_video(request: VideoGenerationRequest):
     
     try:
         # Add task to queue (this will raise QueueFull if queue is at max capacity)
-        await video_generation_queue.put(task)
+        video_generation_queue.put_nowait(task)
+        
+        queue_position = video_generation_queue.qsize()
+        logger.info(f"Task {task_id} queued at position {queue_position}")
         
         return VideoGenerationResponse(
             status="accepted",
-            message=f"Video generation queued. Position in queue: {video_generation_queue.qsize()}",
+            message=f"Video generation queued. Position: {queue_position}",
             task_id=task_id
         )
         
     except asyncio.QueueFull:
         # Remove from active tasks if queue is full
         del active_tasks[task_id]
+        logger.warning(f"Queue full, rejecting task {task_id}")
         raise HTTPException(
             status_code=503, 
             detail="Server busy. Too many pending requests. Please try again later."
@@ -419,56 +588,53 @@ async def generate_video(request: VideoGenerationRequest):
 
 @app.get("/status/{task_id}")
 async def get_task_status(task_id: str):
-    """Get the status of a video generation task."""
+    """Enhanced task status endpoint with detailed progress information."""
     if task_id not in active_tasks:
         raise HTTPException(status_code=404, detail="Task not found")
     
     task = active_tasks[task_id]
-    
-    response = {
-        "task_id": task_id,
-        "status": task.status,
-        "message": task.message,
-        "created_at": task.created_at.isoformat(),
-        "queue_position": None
-    }
+    response = task.to_dict()
     
     # Add queue position if task is still pending
     if task.status == TaskStatus.PENDING:
-        # Calculate position in queue
-        queue_items = list(video_generation_queue._queue)
         try:
-            position = next(i for i, queued_task in enumerate(queue_items) if queued_task.task_id == task_id) + 1
+            # Calculate position in queue more efficiently
+            queue_items = list(video_generation_queue._queue)
+            position = next(
+                (i + 1 for i, queued_task in enumerate(queue_items) 
+                 if queued_task.task_id == task_id), 
+                0
+            )
             response["queue_position"] = position
-        except StopIteration:
-            response["queue_position"] = 0
-    
-    if task.started_at:
-        response["started_at"] = task.started_at.isoformat()
-    
-    if task.completed_at:
-        response["completed_at"] = task.completed_at.isoformat()
-    
-    if task.video_filename:
-        response["video_filename"] = task.video_filename
-    
-    if task.error:
-        response["error"] = task.error
+        except Exception:
+            response["queue_position"] = None
     
     return response
 
 
 @app.get("/download/{filename}")
 async def download_video(filename: str):
-    """Download a generated video file."""
-    # Look for the file in the videos directory
-    file_path = os.path.join(OUTPUT_DIR, filename)
+    """Enhanced video download endpoint with security validation."""
+    # Security: Validate filename to prevent directory traversal
+    if '..' in filename or '/' in filename or '\\' in filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
     
-    if not os.path.exists(file_path):
+    if not filename.endswith('.mp4'):
+        raise HTTPException(status_code=400, detail="Only MP4 files are supported")
+    
+    # Look for the file in the videos directory
+    file_path = OUTPUT_DIR / filename
+    
+    if not file_path.exists():
+        logger.warning(f"Requested file not found: {filename}")
         raise HTTPException(status_code=404, detail="Video file not found")
     
+    # Additional security check
+    if not str(file_path.resolve()).startswith(str(OUTPUT_DIR.resolve())):
+        raise HTTPException(status_code=400, detail="Invalid file path")
+    
     return FileResponse(
-        path=file_path,
+        path=str(file_path),
         media_type="video/mp4",
         filename=filename
     )
