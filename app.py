@@ -326,27 +326,23 @@ def load_pipeline_if_needed(model_id: str, offload_model: bool = True, t5_cpu: b
 
 
 def unload_pipeline():
-    """Enhanced pipeline unloading with better memory management."""
+    """Unload the pipeline and free GPU memory without moving to CPU."""
     global global_pipeline, global_pipeline_config
-    
+
     if global_pipeline is not None:
         logger.info("Unloading pipeline to free GPU memory...")
         try:
-            # Move pipeline components to CPU and clear CUDA cache
-            if hasattr(global_pipeline, 'to'):
-                global_pipeline.to('cpu')
-            
-            # Clear references
+            # Just clear references, do not move to CPU
             global_pipeline = None
             global_pipeline_config = None
-            
+
             # Enhanced memory cleanup
             MemoryManager.cleanup_gpu_memory()
-            
+
             # Log memory status after cleanup
             memory_info = MemoryManager.get_gpu_memory_info()
             logger.info(f"Pipeline unloaded. GPU memory freed: {memory_info['free']:.2f}GB available")
-            
+
         except Exception as e:
             logger.error(f"Error during pipeline unload: {e}")
 

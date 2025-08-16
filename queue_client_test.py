@@ -201,30 +201,30 @@ def test_queue_overflow():
     get_queue_status()
 
 def main():
-    """Main function demonstrating queue-based API usage"""
-    print("🔧 Wan Diffusers Queue-Based API Client")
-    print("=" * 50)
+    # """Main function demonstrating queue-based API usage"""
+    # print("🔧 Wan Diffusers Queue-Based API Client")
+    # print("=" * 50)
     
-    # Test API health
-    if not test_api_health():
-        return
+    # # Test API health
+    # if not test_api_health():
+    #     return
     
-    print("\n" + "=" * 50)
+    # print("\n" + "=" * 50)
     
-    # Get initial queue status
-    print("\n📊 Initial queue status:")
-    get_queue_status()
+    # # Get initial queue status
+    # print("\n📊 Initial queue status:")
+    # get_queue_status()
     
-    # Test 1: Multiple submissions
-    test_multiple_submissions()
+    # # Test 1: Multiple submissions
+    # test_multiple_submissions()
     
-    print("\n" + "=" * 50)
+    # print("\n" + "=" * 50)
     
-    # Test 2: Queue overflow (optional - uncomment to test)
-    # test_queue_overflow()
+    # # Test 2: Queue overflow (optional - uncomment to test)
+    # # test_queue_overflow()
     
-    print("\n✨ Queue demo completed!")
-    print("💡 Try the API documentation at: http://localhost:8000/docs")
-
+    # print("\n✨ Queue demo completed!")
+    # print("💡 Try the API documentation at: http://localhost:8000/docs")
+    submit_video_generation("A cat playing piano in a cozy jazz club", "test-cat-piano")
 if __name__ == "__main__":
     main()
