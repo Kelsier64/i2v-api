@@ -29,7 +29,6 @@ logger = logging.getLogger(__name__)
 OUTPUT_DIR = Path("./videos")
 
 # Constants
-MAX_QUEUE_SIZE = 10
 MAX_WORKERS = 2
 MEMORY_CLEANUP_THRESHOLD = 0.1  # Clean up when less than 10% GPU memory available
 PIPELINE_IDLE_TIMEOUT = 300  # Unload pipeline after 5 minutes of inactivity
@@ -166,7 +165,7 @@ app.add_middleware(
 
 # Global variables for enhanced state management
 active_tasks: Dict[str, 'VideoGenerationTask'] = {}
-video_generation_queue = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
+video_generation_queue = asyncio.Queue()
 executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
 # Enhanced pipeline management
@@ -495,10 +494,12 @@ async def root():
             "generate": "/generate - POST request to generate video (queued)",
             "status": "/status/{task_id} - GET request to check generation status",
             "queue_status": "/queue/status - GET request to check queue status",
+            "queue_clean": "/queue/clean - GET request to clean the queue and remove all tasks",
             "pipeline_status": "/pipeline/status - GET request to check pipeline status and GPU memory",
             "pipeline_unload": "/pipeline/unload - POST request to manually unload pipeline",
             "download": "/download/{filename} - GET request to download generated video",
             "list": "/list - GET request to list all generated videos",
+            "videos_clean": "/videos/clean - GET request to clean videos directory",
             "health": "/health - GET request to check API health"
         }
     }
@@ -695,7 +696,6 @@ async def get_queue_status():
     
     return {
         "queue_size": queue_size,
-        "max_queue_size": video_generation_queue._maxsize,
         "processing_workers": executor._max_workers,
         "task_counts": status_counts,
         "queue_available": queue_size < video_generation_queue._maxsize
@@ -722,20 +722,85 @@ async def get_pipeline_status():
     }
 
 
-@app.post("/pipeline/unload")
-async def manual_unload_pipeline():
-    """Manually unload the pipeline to free GPU memory."""
-    try:
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(executor, unload_pipeline)
+@app.get("/queue/clean")
+async def clean_queue():
+    """Clean the video generation queue and remove all active tasks."""
+    global active_tasks
+    
+    # Clear the queue
+    while not video_generation_queue.empty():
+        try:
+            video_generation_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+    
+    # Count tasks before cleaning
+    total_tasks = len(active_tasks)
+    pending_tasks = sum(1 for task in active_tasks.values() if task.status == TaskStatus.PENDING)
+    processing_tasks = sum(1 for task in active_tasks.values() if task.status == TaskStatus.PROCESSING)
+    
+    # Clear active tasks
+    active_tasks.clear()
+    
+    logger.info(f"Queue cleaned: removed {total_tasks} tasks ({pending_tasks} pending, {processing_tasks} processing)")
+    
+    return {
+        "status": "success",
+        "message": "Queue and active tasks cleaned successfully",
+        "tasks_removed": {
+            "total": total_tasks,
+            "pending": pending_tasks,
+            "processing": processing_tasks
+        },
+        "queue_size": video_generation_queue.qsize()
+    }
+
+
+@app.get("/videos/clean")
+async def clean_videos():
+    """Clean the videos directory by removing all generated video files."""
+    videos_dir = OUTPUT_DIR
+    
+    # Ensure videos directory exists
+    if not videos_dir.exists():
         return {
             "status": "success",
-            "message": "Pipeline unloaded successfully"
+            "message": "Videos directory does not exist",
+            "files_removed": 0,
+            "space_freed_mb": 0
         }
-    except Exception as e:
+    
+    # Count and remove video files
+    removed_files = 0
+    total_size = 0
+    
+    try:
+        for file_path in videos_dir.iterdir():
+            if file_path.is_file() and file_path.suffix.lower() in ['.mp4', '.json']:
+                file_size = file_path.stat().st_size
+                total_size += file_size
+                file_path.unlink()
+                removed_files += 1
+                logger.info(f"Removed file: {file_path.name}")
+        
+        space_freed_mb = total_size / (1024 * 1024)
+        
+        logger.info(f"Videos directory cleaned: removed {removed_files} files, freed {space_freed_mb:.2f}MB")
+        
         return {
-            "status": "error", 
-            "message": f"Failed to unload pipeline: {str(e)}"
+            "status": "success",
+            "message": f"Videos directory cleaned successfully",
+            "files_removed": removed_files,
+            "space_freed_mb": round(space_freed_mb, 2)
+        }
+        
+    except Exception as e:
+        logger.error(f"Error cleaning videos directory: {e}")
+        return {
+            "status": "error",
+            "message": f"Failed to clean videos directory: {str(e)}",
+            "files_removed": removed_files,
+            "space_freed_mb": round(total_size / (1024 * 1024), 2)
         }
 
 
