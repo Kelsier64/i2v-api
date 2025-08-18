@@ -31,7 +31,6 @@ OUTPUT_DIR = Path("./videos")
 # Constants
 MAX_WORKERS = 2
 MEMORY_CLEANUP_THRESHOLD = 0.1  # Clean up when less than 10% GPU memory available
-PIPELINE_IDLE_TIMEOUT = 300  # Unload pipeline after 5 minutes of inactivity
 
 class MemoryManager:
     """Enhanced memory management for GPU resources."""
@@ -117,7 +116,7 @@ class VideoGenerationRequest(BaseModel):
     task: str = Field(default="t2v-1.3B", description="Model variant")
     model_id: Optional[str] = Field(default="Wan-AI/Wan2.1-T2V-1.3B-Diffusers", description="HuggingFace model ID")
     size: str = Field(default="832*480", description="Video resolution in format 'width*height'")
-    num_frames: int = Field(default=81, ge=1, le=200, description="Number of frames to generate")
+    num_frames: int = Field(default=81, ge=1, description="Number of frames to generate")
     sample_guide_scale: float = Field(default=6.0, ge=1.0, le=20.0, description="Guidance scale for sampling")
     sample_shift: Optional[float] = Field(default=None, description="Flow shift parameter (auto-determined if None)")
     sample_steps: int = Field(default=50, ge=10, le=100, description="Number of sampling steps")
@@ -356,15 +355,7 @@ def is_queue_empty_and_no_processing() -> bool:
     return queue_empty and processing_tasks == 0
 
 
-def should_unload_pipeline() -> bool:
-    """Check if pipeline should be unloaded due to inactivity."""
-    global pipeline_last_used
-    
-    if pipeline_last_used is None or global_pipeline is None:
-        return False
-        
-    idle_time = (datetime.now() - pipeline_last_used).total_seconds()
-    return idle_time > PIPELINE_IDLE_TIMEOUT and is_queue_empty_and_no_processing()
+
 
 def generate_wan_video(
     prompt: str = "A cat and a dog baking a cake together in a kitchen. The cat is carefully measuring flour, while the dog is stirring the batter with a wooden spoon. The kitchen is cozy, with sunlight streaming through the window.",
