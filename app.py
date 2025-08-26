@@ -538,8 +538,8 @@ async def generate_video(request: VideoGenerationRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"Invalid size format: {request.size}")
     
-    if request.num_frames < 1 or request.num_frames > 200:
-        raise HTTPException(status_code=400, detail="num_frames must be between 1 and 200")
+    if request.num_frames < 1 or request.num_frames > 241:
+        raise HTTPException(status_code=400, detail="num_frames must be between 1 and 241")
     
     if request.sample_steps < 10 or request.sample_steps > 100:
         raise HTTPException(status_code=400, detail="sample_steps must be between 10 and 100")

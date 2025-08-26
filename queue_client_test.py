@@ -50,8 +50,8 @@ def submit_video_generation(prompt, task_name=None):
         "task": task_name or "t2v-1.3B",
         "size": "832*480",
         "sample_guide_scale": 6.0,
-        "sample_steps": 30,  # Reduced for faster testing
-        "num_frames": 17,  # Reduced for faster testing
+        "sample_steps": 30,  
+        "num_frames": 241, 
         "fps": 16,
     }
     
